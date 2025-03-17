@@ -1,6 +1,12 @@
+<div align="center">
+
 # Copperx Telegram Bot
 
+![Copperx Telegram Bot](assets/banner.jpeg)
+
 A Telegram bot for Copperx Payout integration, built with TypeScript and Node.js.
+
+</div>
 
 ## Features
 
