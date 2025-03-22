@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { CopperxAuthResponse, Transfer } from '../types';
+import crypto from 'crypto';
 
 interface UserProfile {
   id: string;
@@ -80,8 +81,20 @@ export class CopperxAPI {
 
   async authenticateWithOTP(email: string, otp: string, sid: string): Promise<CopperxAuthResponse> {
     const response = await this.client.post('/api/auth/email-otp/authenticate', { email, otp, sid });
-    console.log('Authentication response:', response.data);
-    const { accessToken : token, organizationId } = response.data;
+    console.log('Authentication response:', JSON.stringify(response.data, null, 2));
+    console.log('Response data keys:', Object.keys(response.data));
+    
+    // Extract organization ID from the user object in the response
+    const token = response.data.accessToken;
+    const organizationId = response.data.user?.organizationId;
+    
+    console.log('Extracted values:', {
+      hasToken: !!token,
+      tokenPrefix: token ? token.substring(0, 5) + '...' : 'missing',
+      hasOrgId: !!organizationId,
+      organizationId: organizationId || 'missing'
+    });
+    
     this.setAuthToken(token);
     return { token, organizationId };
   }
@@ -387,5 +400,69 @@ export class CopperxAPI {
       channel_name: channelName,
     });
     return response.data;
+  }
+
+  // Bulk Transfers
+  async sendBatchTransfers(token: string, transfers: Array<{
+    email?: string;
+    walletAddress?: string;
+    amount: string;
+    network?: string;
+    requestId?: string;
+  }>): Promise<{
+    responses: Array<{
+      requestId: string;
+      request: {
+        walletAddress?: string;
+        email?: string;
+        payeeId?: string;
+        amount: string;
+        purposeCode: string;
+        currency: string;
+      };
+      response?: {
+        id: string;
+        status: string;
+        amount: string;
+        [key: string]: any;
+      };
+      error?: {
+        message: any;
+        statusCode: number;
+        error: string;
+      };
+    }>;
+  }> {
+    this.setAuthToken(token);
+    try {
+      console.log('Initiating batch transfers:', JSON.stringify(transfers, null, 2));
+      
+      const requests = transfers.map(transfer => ({
+        requestId: transfer.requestId || crypto.randomUUID(),
+        request: {
+          walletAddress: transfer.walletAddress,
+          email: transfer.email,
+          amount: transfer.amount,
+          purposeCode: 'self',
+          currency: 'USDC'
+        }
+      }));
+
+      const response = await this.client.post('/api/transfers/send-batch', {
+        requests
+      });
+
+      console.log('Batch transfers response:', JSON.stringify(response.data, null, 2));
+      return response.data;
+    } catch (error: any) {
+      console.error('Failed to process batch transfers:', {
+        message: error.message,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        details: error.response?.data?.message || error.response?.data?.details
+      });
+      throw error;
+    }
   }
 } 

@@ -2,7 +2,7 @@ import { Telegraf } from 'telegraf';
 import dotenv from 'dotenv';
 import { BotContext } from './types';
 import { CopperxAPI } from './services/copperx-api';
-import { setupNotifications } from './services/notifications';
+import { setupNotifications, registerDebugCommand } from './services/notifications';
 import axios from 'axios';
 import { PostgresSession } from './middleware/session';
 import { initializeDatabase } from './config/database';
@@ -150,6 +150,7 @@ bot.command('help', async (ctx) => {
 💰 <b>Wallet</b>
 • /balance - View your wallet balances
 • /deposit - Get deposit instructions
+• /setdefault - Set your default wallet
 
 💸 <b>Transfer</b>
 • /send - Send funds to email or wallet
@@ -304,6 +305,50 @@ Use /deposit to get deposit instructions.`;
   }
 });
 
+// Set Default Wallet command
+bot.command('setdefault', async (ctx) => {
+  console.log('Set Default Wallet command triggered');
+  if (!ctx.session?.authToken) {
+    await ctx.reply('⚠️ Please /login first to set your default wallet.');
+    return;
+  }
+
+  try {
+    const wallets = await api.getWallets(ctx.session.authToken);
+    
+    if (!wallets || wallets.length === 0) {
+      await ctx.reply('⚠️ No wallets found in your account. Please contact support if you believe this is an error.');
+      return;
+    }
+
+    // Create keyboard with wallet options
+    const keyboard = {
+      inline_keyboard: wallets.map(wallet => [{
+        text: `${wallet.isDefault ? '✅' : '💰'} ${wallet.network} - ${Number(wallet.balance).toFixed(2)} USDC`,
+        callback_data: `set_default_${wallet.id}`
+      }])
+    };
+
+    await ctx.reply(
+      '🏦 <b>Select Default Wallet</b>\n\n' +
+      'Choose which wallet you want to set as your default:\n' +
+      '<i>Current default wallet is marked with ✅</i>',
+      { 
+        parse_mode: 'HTML',
+        reply_markup: keyboard 
+      }
+    );
+  } catch (error) {
+    console.error('Error fetching wallets:', error);
+    if (axios.isAxiosError(error) && error.response?.status === 401) {
+      ctx.session = {};
+      await ctx.reply('⚠️ Your session has expired. Please /login again.');
+    } else {
+      await ctx.reply('❌ Failed to fetch wallets. Please try again later.');
+    }
+  }
+});
+
 // Deposit command
 bot.command('deposit', async (ctx) => {
   console.log('Deposit command triggered');
@@ -402,12 +447,123 @@ bot.command('send', async (ctx) => {
   const keyboard = {
     inline_keyboard: [
       [{ text: 'Send to Email', callback_data: 'send_email' }],
-      [{ text: 'Send to Wallet', callback_data: 'send_wallet' }]
+      [{ text: 'Send to Wallet', callback_data: 'send_wallet' }],
+      [{ text: 'Bulk Transfer', callback_data: 'send_bulk' }]
     ]
   };
 
   await ctx.reply('How would you like to send funds?', { reply_markup: keyboard });
-  
+});
+
+// Bulk transfer command
+bot.command('bulk', async (ctx) => {
+  console.log('Bulk transfer command triggered');
+  if (!ctx.session?.authToken) {
+    await ctx.reply('Please /login first to make bulk transfers.');
+    return;
+  }
+
+  const message = `
+<b>📦 Bulk Transfer Instructions</b>
+
+To make bulk transfers, please send a CSV file with the following format:
+<code>email,amount</code> or <code>walletAddress,amount,network</code>
+
+Example:
+<code>user@example.com,100</code>
+<code>0x123...abc,100,polygon</code>
+
+<i>Note: 
+• Minimum amount per transfer: 1 USDC
+• Maximum transfers per batch: 100
+• Supported networks: Polygon, Arbitrum, Base</i>`;
+
+  await ctx.reply(message, { parse_mode: 'HTML' });
+});
+
+// Handle file uploads for bulk transfers
+bot.on('document', async (ctx) => {
+  if (!ctx.session?.authToken) {
+    await ctx.reply('Please /login first to make bulk transfers.');
+    return;
+  }
+
+  const file = ctx.message.document;
+  if (!file.file_name?.endsWith('.csv')) {
+    await ctx.reply('Please upload a CSV file.');
+    return;
+  }
+
+  try {
+    // Get file from Telegram
+    const fileLink = await ctx.telegram.getFileLink(file.file_id);
+    if (!fileLink) {
+      throw new Error('Could not get file link');
+    }
+
+    // Download and process the file
+    const response = await axios.get(fileLink.toString());
+    const csvContent = response.data;
+    const lines = csvContent.split('\n').filter((line: string) => line.trim());
+
+    if (lines.length === 0) {
+      await ctx.reply('The CSV file is empty.');
+      return;
+    }
+
+    if (lines.length > 100) {
+      await ctx.reply('Maximum 100 transfers allowed per batch.');
+      return;
+    }
+
+    const transfers = lines.map((line: string) => {
+      const [recipient, amount, network] = line.split(',').map((item: string) => item.trim());
+      const transferAmount = (parseFloat(amount) * 10 ** 8).toString();
+
+      if (recipient.includes('@')) {
+        return { email: recipient, amount: transferAmount };
+      } else {
+        return { 
+          walletAddress: recipient, 
+          amount: transferAmount,
+          network: network?.toLowerCase() || 'polygon'
+        };
+      }
+    });
+
+    // Validate transfers
+    for (const transfer of transfers) {
+      if (parseFloat(transfer.amount) < 10 ** 8) {
+        await ctx.reply('Minimum transfer amount is 1 USDC.');
+        return;
+      }
+
+      if (transfer.walletAddress && !transfer.walletAddress.startsWith('0x')) {
+        await ctx.reply('Invalid wallet address format. Must start with 0x.');
+        return;
+      }
+    }
+
+    // Process bulk transfers
+    const results = await api.sendBatchTransfers(ctx.session.authToken, transfers);
+    
+    // Format success message
+    const successCount = results.responses.filter(r => r.response).length;
+    const failedCount = results.responses.filter(r => r.error).length;
+
+    const message = `
+<b>📦 Bulk Transfer Results</b>
+
+✅ Successful transfers: ${successCount}
+❌ Failed transfers: ${failedCount}
+
+<i>You will receive notifications for each transfer as they are processed.</i>`;
+
+    await ctx.reply(message, { parse_mode: 'HTML' });
+  } catch (error) {
+    console.error('Bulk transfer error:', error);
+    await ctx.reply('Failed to process bulk transfers. Please check the file format and try again.');
+  }
 });
 
 // Withdraw command
@@ -541,9 +697,26 @@ bot.on('text', async (ctx) => {
     try {
       const { token, organizationId } = await api.authenticateWithOTP(ctx.session.email, otp, ctx.session.sid);
       
+      console.log('Authentication result:', {
+        hasToken: !!token,
+        tokenPrefix: token ? token.substring(0, 5) + '...' : 'none',
+        hasOrgId: !!organizationId,
+        organizationId: organizationId || 'missing',
+        responseKeys: Object.keys({ token, organizationId })
+      });
+      
       ctx.session.authToken = token;
       ctx.session.organizationId = organizationId;
       ctx.session.email = ctx.session.email;
+      
+      // Log the session after updating it
+      console.log('Updated session:', {
+        hasAuthToken: !!ctx.session.authToken,
+        hasOrgId: !!ctx.session.organizationId,
+        organizationId: ctx.session.organizationId || 'missing',
+        sessionKeys: Object.keys(ctx.session)
+      });
+      
       delete ctx.session.awaitingOTP;
       delete ctx.session.sid;
 
@@ -996,6 +1169,46 @@ Minimum deposit: 1 USDC
 
 <i>Note: The deposit will be processed on the Ethereum network (Chain ID: 1).</i>`, { parse_mode: 'HTML' });
       break;
+
+    // Handle setting default wallet
+    case action.match(/^set_default_/)?.input:
+      if (!ctx.session?.authToken) {
+        await ctx.editMessageText('⚠️ Your session has expired. Please /login again.');
+        return;
+      }
+
+      const walletId = action.replace('set_default_', '');
+      
+      try {
+        await api.setDefaultWallet(ctx.session.authToken, walletId);
+        await ctx.editMessageText('✅ Successfully set your default wallet!');
+      } catch (error) {
+        console.error('Error setting default wallet:', error);
+        if (axios.isAxiosError(error) && error.response?.status === 401) {
+          ctx.session = {};
+          await ctx.editMessageText('⚠️ Your session has expired. Please /login again.');
+        } else {
+          await ctx.editMessageText('❌ Failed to set default wallet. Please try again later.');
+        }
+      }
+      break;
+
+    case 'send_bulk':
+      await ctx.editMessageText(`
+<b>📦 Bulk Transfer Instructions</b>
+
+To make bulk transfers, please send a CSV file with the following format:
+<code>email,amount</code> or <code>walletAddress,amount,network</code>
+
+Example:
+<code>user@example.com,100</code>
+<code>0x123...abc,100,polygon</code>
+
+<i>Note: 
+• Minimum amount per transfer: 1 USDC
+• Maximum transfers per batch: 100
+• Supported networks: Polygon, Arbitrum, Base</i>`, { parse_mode: 'HTML' });
+      break;
   }
 });
 
@@ -1181,10 +1394,12 @@ bot.action('help_main', async (ctx) => {
 💰 <b>Wallet</b>
 • /balance - View your wallet balances
 • /deposit - Get deposit instructions
+• /setdefault - Set your default wallet
 
 💸 <b>Transfer</b>
 • /send - Send funds to email or wallet
 • /withdraw - Withdraw funds to bank account
+• /bulk - Make bulk transfers via CSV
 
 📊 <b>History</b>
 • /history - View transaction history
@@ -1200,8 +1415,6 @@ Need help? Visit our community: <a href="https://t.me/copperxcommunity/2183">Cop
   });
 });
 
-// Setup notifications
-setupNotifications(bot, api);
 
 // Handle errors
 bot.catch((err, ctx) => {
@@ -1209,11 +1422,39 @@ bot.catch((err, ctx) => {
   ctx.reply('An error occurred. Please try again later or contact support.');
 });
 
+// Set bot commands
+async function setBotCommands() {
+  await bot.telegram.setMyCommands([
+    { command: 'start', description: 'Start the bot' },
+    { command: 'login', description: 'Login to your Copperx account' },
+    { command: 'logout', description: 'Logout from your account' },
+    { command: 'help', description: 'Show available commands' },
+    { command: 'status', description: 'Check your KYC/KYB status' },
+    { command: 'balance', description: 'View your wallet balances' },
+    { command: 'deposit', description: 'Get deposit instructions' },
+    { command: 'setdefault', description: 'Set your default wallet' },
+    { command: 'send', description: 'Send funds to email or wallet' },
+    { command: 'withdraw', description: 'Withdraw funds to bank account' },
+    { command: 'history', description: 'View transaction history' },
+    { command: 'bulk', description: 'Make bulk transfers via CSV' }
+  ]);
+  console.log('Bot commands registered');
+}
+
 // Start bot
 async function startBot() {
   try {
     // Initialize database before starting the bot
     await initializeDatabase();
+
+    // Initialize notifications
+    setupNotifications(bot, api);
+    
+    // Register debug command
+    registerDebugCommand(bot, api);
+    
+    // Register commands
+    await setBotCommands();
     
     await bot.launch();
     console.log('Bot is running...');
