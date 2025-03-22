@@ -666,7 +666,7 @@ bot.on('text', async (ctx) => {
         sid: sid
       };
       
-      await ctx.reply('Please enter the OTP sent to your email. The OTP is valid for 5 minutes.');
+      await ctx.reply('Please enter the OTP sent to your email. The OTP is valid for 15 minutes.');
     } catch (error) {
       if (axios.isAxiosError(error)) {
         if (error.response?.status === 429) {
@@ -787,8 +787,8 @@ bot.on('text', async (ctx) => {
           return;
         }
 
-        if (amount < 100) {
-          await ctx.reply('Minimum withdrawal amount is 100 USDC. Please enter a larger amount.');
+        if (amount < 50) {
+          await ctx.reply('Minimum withdrawal amount is 50 USDC. Please enter a larger amount.');
           return;
         }
 
@@ -860,31 +860,61 @@ bot.on('text', async (ctx) => {
               }
             }
           } else if (ctx.session.transferType === 'bank') {
-            // Store the amount and move to next step
+            // Store the amount and get quote
             ctx.session.transferAmount = amount.toString();
-            ctx.session.transferStep = 'bank_details';
             
-            const keyboard = {
-              inline_keyboard: [
-                [
-                  { text: 'Salary', callback_data: 'source_salary' },
-                  { text: 'Savings', callback_data: 'source_savings' }
-                ],
-                [
-                  { text: 'Lottery', callback_data: 'source_lottery' },
-                  { text: 'Investment', callback_data: 'source_investment' }
-                ],
-                [
-                  { text: 'Loan', callback_data: 'source_loan' },
-                  { text: 'Business Income', callback_data: 'source_business_income' }
-                ],
-                [
-                  { text: 'Others', callback_data: 'source_others' }
+            try {
+              const quote = await api.getOfframpQuote(
+                ctx.session.authToken!,
+                amount.toString(),
+                'ind',
+                ctx.session.selectedBankId // Add the selected bank ID to the quote request
+              );
+
+              console.log('Quote:', JSON.stringify(quote, null, 2));
+              let quotePayload = JSON.parse(quote.quotePayload);
+
+              const amountInUSDC = parseFloat(amount.toString()) / 10 ** 8;
+              const feeInUSDC = parseFloat(quotePayload.totalFee) / 10 ** 8;
+              const rateINR = parseFloat(quotePayload.rate);
+              const toCurrency = quotePayload.toCurrency;
+              const amountInINR = parseFloat(quotePayload.toAmount) / 10 ** 8;
+
+              const keyboard = {
+                inline_keyboard: [
+                  [
+                    { text: '✅ Accept Quote', callback_data: 'accept_quote' },
+                    { text: '❌ Cancel', callback_data: 'cancel_quote' }
+                  ]
                 ]
-              ]
-            };
-            
-            await ctx.reply('Please select your source of funds:', { reply_markup: keyboard });
+              };
+
+              // Store quote data in session
+              ctx.session.quotePayload = JSON.stringify(quote.quotePayload);
+              ctx.session.quoteSignature = quote.quoteSignature;
+              ctx.session.arrivalTimeMessage = quote.arrivalTimeMessage;
+
+              await ctx.reply(
+                `💱 <b>Bank Withdrawal Quote</b>\n\n` +
+                `Amount: ${amountInUSDC.toFixed(2)} USDC\n` +
+                `Fee: ${feeInUSDC.toFixed(2)} USDC\n` +
+                `Rate: 1 USDC = ${rateINR.toFixed(2)} ${toCurrency}\n` +
+                `You will receive: ${amountInINR.toFixed(2)} ${toCurrency}\n\n` +
+                `Processing Time: ${quote.arrivalTimeMessage}\n\n` +
+                `<i>Please review and accept the quote to proceed.</i>`,
+                { 
+                  parse_mode: 'HTML',
+                  reply_markup: keyboard 
+                }
+              );
+            } catch (error) {
+              console.error('Error getting quote:', error);
+              await ctx.reply('Failed to get withdrawal quote. Please try again later.');
+              // Clear session data
+              delete ctx.session.transferType;
+              delete ctx.session.transferStep;
+              delete ctx.session.transferAmount;
+            }
             return;
           }
 
@@ -921,21 +951,6 @@ bot.on('text', async (ctx) => {
         break;
 
       case 'bank_details':
-        if (!ctx.session.transferAmount) {
-          await ctx.reply('Amount not found. Please start the withdrawal process again.');
-          return;
-        }
-
-        const callbackQuery = ctx.callbackQuery as any;
-        const action = callbackQuery.data;
-
-        // Store the source of funds
-        ctx.session.sourceOfFunds = action.replace('source_', '');
-        ctx.session.transferStep = 'customer_details';
-        
-        await ctx.editMessageText('Please enter your full name:');
-        break;
-
       case 'customer_details':
         if (!ctx.session.sourceOfFunds) {
           await ctx.reply('Source of funds not selected. Please start the withdrawal process again.');
@@ -990,32 +1005,18 @@ bot.on('text', async (ctx) => {
             return;
           }
 
-          // Generate a unique invoice number
-          const invoiceNumber = `INV-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-          
-          // Prepare the bank withdrawal request
-          const bankDetails = {
-            invoiceNumber,
-            invoiceUrl: `https://copperx.io/invoice/${invoiceNumber}`, // This would be a real URL in production
-            sourceOfFunds: ctx.session.sourceOfFunds,
-            recipientRelationship: 'self',
-            quotePayload: 'string', // This would be a real quote payload in production
-            quoteSignature: 'string', // This would be a real signature in production
-            preferredWalletId: defaultWallet.id,
-            customerData: {
-              name: ctx.session.customerName!,
-              email: ctx.session.customerEmail!,
-              country: ctx.session.customerCountry!
-            }
-          };
-
           const response = await api.withdrawToBank(
             ctx.session.authToken!,
             ctx.session.transferAmount!,
-            bankDetails
+            {
+              quotePayload: ctx.session.quotePayload!,
+              quoteSignature: ctx.session.quoteSignature!,
+              purposeCode: ctx.session.sourceOfFunds!
+            }
           );
 
-          await ctx.reply(`✅ Successfully initiated bank withdrawal for ${parseFloat(ctx.session.transferAmount!) / 10 ** 8} USDC\n\nProcessing time: 1-2 business days\n\nYou will receive a notification once the withdrawal is processed.`);
+          const amountInUSDC = parseFloat(ctx.session.transferAmount!) / 10 ** 8;
+          await ctx.reply(`✅ Successfully initiated bank withdrawal for ${amountInUSDC.toFixed(2)} USDC\n\nProcessing time: ${ctx.session.arrivalTimeMessage || '2-4 business days'}\n\nYou will receive a notification once the withdrawal is processed.`);
         } catch (error: any) {
           console.error('Bank withdrawal error:', error);
           await ctx.reply('Failed to process bank withdrawal. Please try again later.');
@@ -1028,7 +1029,53 @@ bot.on('text', async (ctx) => {
           delete ctx.session.customerName;
           delete ctx.session.customerEmail;
           delete ctx.session.customerCountry;
+          delete ctx.session.quotePayload;
+          delete ctx.session.quoteSignature;
+          delete ctx.session.arrivalTimeMessage;
         }
+        break;
+
+      case 'accept_quote':
+        if (!ctx.session?.transferAmount || !ctx.session?.quotePayload || !ctx.session?.quoteSignature) {
+          await ctx.editMessageText('Quote expired. Please start the withdrawal process again.');
+          return;
+        }
+
+        ctx.session.transferStep = 'customer_details';
+        
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: 'Salary', callback_data: 'source_salary' },
+              { text: 'Savings', callback_data: 'source_savings' }
+            ],
+            [
+              { text: 'Lottery', callback_data: 'source_lottery' },
+              { text: 'Investment', callback_data: 'source_investment' }
+            ],
+            [
+              { text: 'Loan', callback_data: 'source_loan' },
+              { text: 'Business Income', callback_data: 'source_business_income' }
+            ],
+            [
+              { text: 'Others', callback_data: 'source_others' }
+            ]
+          ]
+        };
+        
+        await ctx.editMessageText('Please select your source of funds:', { reply_markup: keyboard });
+        break;
+
+      case 'cancel_quote':
+        // Clear quote-related session data
+        delete ctx.session.transferType;
+        delete ctx.session.transferStep;
+        delete ctx.session.transferAmount;
+        delete ctx.session.quotePayload;
+        delete ctx.session.quoteSignature;
+        delete ctx.session.arrivalTimeMessage;
+        
+        await ctx.editMessageText('Bank withdrawal cancelled. Use /withdraw to start again.');
         break;
     }
   } catch (error) {
@@ -1062,6 +1109,49 @@ bot.on('callback_query', async (ctx) => {
   const action = callbackQuery.data;
 
   switch (action) {
+    case 'accept_quote':
+      if (!ctx.session?.transferAmount || !ctx.session?.quotePayload || !ctx.session?.quoteSignature) {
+        await ctx.editMessageText('Quote expired. Please start the withdrawal process again.');
+        return;
+      }
+
+      ctx.session.transferStep = 'customer_details';
+      
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: 'Salary', callback_data: 'source_salary' },
+            { text: 'Savings', callback_data: 'source_savings' }
+          ],
+          [
+            { text: 'Lottery', callback_data: 'source_lottery' },
+            { text: 'Investment', callback_data: 'source_investment' }
+          ],
+          [
+            { text: 'Loan', callback_data: 'source_loan' },
+            { text: 'Business Income', callback_data: 'source_business_income' }
+          ],
+          [
+            { text: 'Others', callback_data: 'source_others' }
+          ]
+        ]
+      };
+      
+      await ctx.editMessageText('Please select your source of funds:', { reply_markup: keyboard });
+      break;
+
+    case 'cancel_quote':
+      // Clear quote-related session data
+      delete ctx.session.transferType;
+      delete ctx.session.transferStep;
+      delete ctx.session.transferAmount;
+      delete ctx.session.quotePayload;
+      delete ctx.session.quoteSignature;
+      delete ctx.session.arrivalTimeMessage;
+      
+      await ctx.editMessageText('Bank withdrawal cancelled. Use /withdraw to start again.');
+      break;
+
     case 'send_email':
       ctx.session = {
         ...ctx.session,
@@ -1094,16 +1184,39 @@ bot.on('callback_query', async (ctx) => {
       ctx.session = {
         ...ctx.session,
         transferType: 'bank',
-        transferStep: 'amount'
+        transferStep: 'select_bank'
       };
-      await ctx.editMessageText(`
-<b>Bank Withdrawal Instructions</b> 🏦
 
-Please enter the amount you want to withdraw (in USDC).
-Minimum withdrawal amount: 100 USDC
-Processing time: 1-2 business days
+      try {
+        const accounts = await api.getAccounts(ctx.session.authToken!);
+        const bankAccounts = accounts.data.filter(
+          (acc: any) => acc.type === 'bank_account' && acc.status === 'verified'
+        );
 
-<i>Note: You will need to provide additional details in the next steps.</i>`, { parse_mode: 'HTML' });
+        if (bankAccounts.length === 0) {
+          await ctx.editMessageText('No verified bank accounts found. Please add a bank account first.');
+          return;
+        }
+
+        const keyboard = {
+          inline_keyboard: bankAccounts.map((acc: any) => [{
+            text: `${acc.bankAccount.bankName} - ${acc.bankAccount.bankAccountNumber}`,
+            callback_data: `bank_${acc.id}`
+          }])
+        };
+
+        await ctx.editMessageText(
+          '🏦 <b>Select Bank Account</b>\n\n' +
+          'Please choose the bank account you want to withdraw to:',
+          { 
+            parse_mode: 'HTML',
+            reply_markup: keyboard 
+          }
+        );
+      } catch (error) {
+        console.error('Error fetching bank accounts:', error);
+        await ctx.editMessageText('Failed to fetch bank accounts. Please try again later.');
+      }
       break;
 
     case 'withdraw_wallet':
@@ -1208,6 +1321,105 @@ Example:
 • Minimum amount per transfer: 1 USDC
 • Maximum transfers per batch: 100
 • Supported networks: Polygon, Arbitrum, Base</i>`, { parse_mode: 'HTML' });
+      break;
+
+    // Handle source of funds selection
+    case action.match(/^source_/)?.input:
+      if (!ctx.session?.transferAmount || !ctx.session?.quotePayload || !ctx.session?.quoteSignature) {
+        await ctx.editMessageText('Quote expired. Please start the withdrawal process again.');
+        return;
+      }
+
+      try {
+        const sourceOfFunds = action.replace('source_', '');
+        const response = await api.withdrawToBank(
+          ctx.session.authToken!,
+          ctx.session.transferAmount!,
+          {
+            quotePayload: ctx.session.quotePayload,
+            quoteSignature: ctx.session.quoteSignature,
+            purposeCode: sourceOfFunds
+          }
+        );
+
+        const amountInUSDC = parseFloat(ctx.session.transferAmount!) / 10 ** 8;
+        await ctx.editMessageText(`✅ Successfully initiated bank withdrawal for ${amountInUSDC.toFixed(2)} USDC\n\nProcessing time: ${ctx.session.arrivalTimeMessage || '2-4 business days'}\n\nYou will receive a notification once the withdrawal is processed.`);
+
+        // Clear all session data
+        delete ctx.session.transferType;
+        delete ctx.session.transferStep;
+        delete ctx.session.transferAmount;
+        delete ctx.session.quotePayload;
+        delete ctx.session.quoteSignature;
+        delete ctx.session.arrivalTimeMessage;
+      } catch (error: any) {
+        console.error('Bank withdrawal error:', error);
+        await ctx.editMessageText('Failed to process bank withdrawal. Please try again later.');
+      }
+      break;
+
+    // Handle bank selection
+    case action.match(/^bank_/)?.input:
+      const bankId = action.replace('bank_', '');
+      ctx.session = {
+        ...ctx.session,
+        selectedBankId: bankId,
+        transferStep: 'amount'
+      };
+      
+      await ctx.editMessageText(`
+<b>Bank Withdrawal Instructions</b> 🏦
+
+Please enter the amount you want to withdraw (in USDC).
+Minimum withdrawal amount: 50 USDC
+Processing time: 1-2 business days
+
+<i>Note: You will need to provide additional details in the next steps.</i>`, { parse_mode: 'HTML' });
+      break;
+
+    case 'source_salary':
+    case 'source_savings':
+    case 'source_lottery':
+    case 'source_investment':
+    case 'source_loan':
+    case 'source_business_income':
+    case 'source_others':
+      const selectedSourceOfFunds = action.replace('source_', '');
+      
+      try {
+        if (!ctx.session?.transferAmount || !ctx.session?.quotePayload || !ctx.session?.quoteSignature) {
+          await ctx.editMessageText('Quote expired. Please start the withdrawal process again.');
+          return;
+        }
+
+        const response = await api.withdrawToBank(
+          ctx.session.authToken!,
+          ctx.session.transferAmount!,
+          {
+            quotePayload: ctx.session.quotePayload,
+            quoteSignature: ctx.session.quoteSignature,
+            purposeCode: selectedSourceOfFunds
+          }
+        );
+
+        const amountInUSDC = parseFloat(ctx.session.transferAmount!) / 10 ** 8;
+        await ctx.editMessageText(`✅ Successfully initiated bank withdrawal for ${amountInUSDC.toFixed(2)} USDC\n\nProcessing time: ${ctx.session.arrivalTimeMessage || '2-4 business days'}\n\nYou will receive a notification once the withdrawal is processed.`);
+
+        // Clear all session data
+        delete ctx.session.transferType;
+        delete ctx.session.transferStep;
+        delete ctx.session.transferAmount;
+        delete ctx.session.quotePayload;
+        delete ctx.session.quoteSignature;
+        delete ctx.session.arrivalTimeMessage;
+      } catch (error: any) {
+        console.error('Bank withdrawal error:', error);
+        await ctx.editMessageText('Failed to process bank withdrawal. Please try again later.');
+      }
+      break;
+
+    case 'bank_':
+      // ... existing code ...
       break;
   }
 });

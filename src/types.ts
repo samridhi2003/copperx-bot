@@ -8,7 +8,7 @@ export interface SessionData {
   awaitingOTP?: boolean;
   sid?: string;
   transferType?: 'email' | 'wallet' | 'bank';
-  transferStep?: 'recipient' | 'address' | 'amount' | 'bank_details' | 'customer_details' | 'customer_email' | 'customer_country';
+  transferStep?: 'recipient' | 'address' | 'amount' | 'bank_details' | 'customer_details' | 'customer_email' | 'customer_country' | 'source_salary' | 'source_savings' | 'source_lottery' | 'source_investment' | 'source_loan' | 'source_business_income' | 'source_others' | 'accept_quote' | 'cancel_quote' | 'select_bank';
   transferRecipient?: string;
   transferAddress?: string;
   network?: string;
@@ -20,6 +20,10 @@ export interface SessionData {
   customerCountry?: string;
   depositStep?: 'amount';
   depositSourceOfFunds?: string;
+  quotePayload?: string;
+  quoteSignature?: string;
+  arrivalTimeMessage?: string;
+  selectedBankId?: string;
 }
 
 type CallbackData = 'send_email' | 'send_wallet' | 'withdraw_bank' | 'withdraw_wallet';

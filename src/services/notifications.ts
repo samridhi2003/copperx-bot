@@ -3,6 +3,7 @@ import { BotContext } from '../types';
 import { Telegraf } from 'telegraf';
 import { CopperxAPI } from './copperx-api';
 import axios from 'axios';
+import { pool } from '../config/database';
 
 interface DepositNotification {
   amount: string;
@@ -16,6 +17,29 @@ let activeSubscriptions = new Map<string, {
   pusher: Pusher, 
   channel: ReturnType<Pusher['subscribe']> 
 }>();
+
+// Function to load all active sessions and subscribe to notifications
+async function loadAndSubscribeExistingSessions(api: CopperxAPI, bot: Telegraf<BotContext>) {
+  try {
+    console.log('Loading existing sessions from database...');
+    const result = await pool.query(
+      'SELECT user_id, chat_id, session_data FROM bot_sessions WHERE session_data->\'authToken\' IS NOT NULL AND session_data->\'organizationId\' IS NOT NULL'
+    );
+
+    console.log(`Found ${result.rows.length} active sessions`);
+
+    for (const row of result.rows) {
+      const { session_data: sessionData, chat_id: chatId } = row;
+      if (sessionData.authToken && sessionData.organizationId) {
+        console.log(`Setting up notifications for organization ${sessionData.organizationId} and chat ${chatId}`);
+        await subscribeToOrganization(api, bot, sessionData.organizationId, chatId, sessionData.authToken);
+      }
+    }
+    console.log('Finished subscribing to notifications for existing sessions');
+  } catch (error) {
+    console.error('Error loading and subscribing to existing sessions:', error);
+  }
+}
 
 // Function to subscribe to organization's channel
 async function subscribeToOrganization(api: CopperxAPI, bot: Telegraf<BotContext>, organizationId: string, chatId: number, authToken: string) {
@@ -42,7 +66,6 @@ async function subscribeToOrganization(api: CopperxAPI, bot: Telegraf<BotContext
     console.log('Creating new Pusher client with key:', process.env.PUSHER_KEY?.substring(0, 5) + '...');
     console.log('Cluster:', process.env.PUSHER_CLUSTER);
     
-    // Try with direct auth parameters instead of custom authorizer
     const pusherClient = new Pusher(process.env.PUSHER_KEY!, {
       cluster: process.env.PUSHER_CLUSTER!,
       forceTLS: true,
@@ -52,27 +75,40 @@ async function subscribeToOrganization(api: CopperxAPI, bot: Telegraf<BotContext
         headers: {
           Authorization: `Bearer ${authToken}`
         }
-      }
+      },
+      activityTimeout: 30000, // 30s timeout
+      pongTimeout: 10000, // 10s pong timeout
+      unavailableTimeout: 10000, // 10s unavailable timeout
+      wsHost: undefined, // Use default host
+      wsPort: undefined, // Use default port
+      wssPort: undefined, // Use default port
+      disableStats: true // Disable stats collection
     });
 
-    console.log('Pusher client created, setting up event listeners');
-    
-    // Global event binding for the client
-    pusherClient.bind_global((event: string, data: any) => {
-      console.log(`Global Pusher event received: ${event}`, data);
+    // Enhanced connection state logging
+    pusherClient.connection.bind('state_change', ({ current, previous }: { current: string; previous: string }) => {
+      console.log(`Pusher connection state changed from ${previous} to ${current} for channel ${channelName}`);
     });
-    
-    // Handle Pusher connection events
+
     pusherClient.connection.bind('connected', () => {
       console.log(`Successfully connected to Pusher for channel: ${channelName}`);
     });
 
-    pusherClient.connection.bind('error', (error: Error) => {
-      console.error(`Pusher connection error for channel ${channelName}:`, error);
+    pusherClient.connection.bind('connecting', () => {
+      console.log(`Connecting to Pusher for channel: ${channelName}...`);
     });
 
     pusherClient.connection.bind('disconnected', () => {
       console.log(`Disconnected from Pusher for channel: ${channelName}`);
+      // Attempt to reconnect after a delay
+      setTimeout(() => {
+        console.log(`Attempting to reconnect to channel: ${channelName}`);
+        pusherClient.connect();
+      }, 5000);
+    });
+
+    pusherClient.connection.bind('error', (error: Error) => {
+      console.error(`Pusher connection error for channel ${channelName}:`, error);
     });
 
     // Log current connection state
@@ -84,24 +120,17 @@ async function subscribeToOrganization(api: CopperxAPI, bot: Telegraf<BotContext
     console.log('Channel subscription initialized');
 
     // Monitor all channel events for debugging
-    channel.bind_global((event: string, data: any) => {
-      console.log(`Global event received on channel ${channelName}:`, event, data);
+    channel.bind_global((eventName: string, data: any) => {
+      console.log(`Global event received on channel ${channelName}:`, {
+        event: eventName,
+        data: JSON.stringify(data, null, 2),
+        connectionState: pusherClient.connection.state,
+        channelState: channel.subscribed ? 'subscribed' : 'not subscribed'
+      });
     });
 
-    // Handle subscription success
-    channel.bind('pusher:subscription_succeeded', () => {
-      console.log(`Successfully subscribed to channel: ${channelName}`);
-      activeSubscriptions.set(channelName, { pusher: pusherClient, channel });
-    });
-
-    // Handle subscription error
-    channel.bind('pusher:subscription_error', (error: any) => {
-      console.error(`Subscription error for channel ${channelName}:`, JSON.stringify(error, null, 2));
-      activeSubscriptions.delete(channelName);
-    });
-
-    // Handle deposit events
-    channel.bind('deposit', (data: any) => {
+    // Handle deposit events - bind before subscription success
+    channel.bind('deposit', (data: DepositNotification) => {
       console.log('Received deposit event:', JSON.stringify(data, null, 2));
       
       try {
@@ -109,6 +138,10 @@ async function subscribeToOrganization(api: CopperxAPI, bot: Telegraf<BotContext
         const network = data.network;
         const status = data.status;
         const timestamp = new Date(data.timestamp).toLocaleString();
+
+        if (isNaN(amount)) {
+          throw new Error(`Invalid amount received: ${data.amount}`);
+        }
 
         const message = `
 💰 <b>New Deposit Received</b>
@@ -127,14 +160,47 @@ Transaction ID: <code>${data.transactionId}</code>`;
           console.log('Successfully sent deposit notification');
         }).catch(error => {
           console.error('Error sending deposit notification:', error);
+          // Retry once after a delay
+          setTimeout(() => {
+            bot.telegram.sendMessage(chatId, message, {
+              parse_mode: 'HTML'
+            }).catch(retryError => {
+              console.error('Error sending deposit notification after retry:', retryError);
+            });
+          }, 2000);
         });
       } catch (error) {
         console.error('Error processing deposit notification:', error);
       }
     });
 
+    // Handle subscription success
+    channel.bind('pusher:subscription_succeeded', () => {
+      console.log(`Successfully subscribed to channel: ${channelName}`);
+      activeSubscriptions.set(channelName, { pusher: pusherClient, channel });
+    });
+
+    // Handle subscription error
+    channel.bind('pusher:subscription_error', (error: any) => {
+      console.error(`Subscription error for channel ${channelName}:`, {
+        error: JSON.stringify(error, null, 2),
+        connectionState: pusherClient.connection.state,
+        authToken: authToken ? 'present' : 'missing'
+      });
+      activeSubscriptions.delete(channelName);
+      
+      // Attempt to resubscribe after a delay if connection is still active
+      if (pusherClient.connection.state === 'connected') {
+        setTimeout(() => {
+          console.log(`Attempting to resubscribe to channel: ${channelName}`);
+          pusherClient.subscribe(channelName);
+        }, 5000);
+      }
+    });
+
   } catch (error) {
     console.error('Error setting up organization subscription:', error);
+    throw error; // Propagate error to caller
   }
 }
 
@@ -152,6 +218,9 @@ function unsubscribeFromOrganization(organizationId: string) {
 
 export function setupNotifications(bot: Telegraf<BotContext>, api: CopperxAPI) {
   console.log('Initializing Pusher notifications service...');
+
+  // Load and subscribe to existing sessions when the bot starts
+  loadAndSubscribeExistingSessions(api, bot);
 
   // Subscribe to notifications when user logs in
   bot.use(async (ctx, next) => {

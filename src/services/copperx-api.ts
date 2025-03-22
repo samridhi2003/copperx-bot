@@ -286,28 +286,16 @@ export class CopperxAPI {
   }
 
   async withdrawToBank(token: string, amount: string, bankDetails: {
-    invoiceNumber: string;
-    invoiceUrl: string;
-    sourceOfFunds: string;
-    recipientRelationship: string;
     quotePayload: string;
     quoteSignature: string;
-    preferredWalletId: string;
-    customerData: {
-      name: string;
-      businessName?: string;
-      email: string;
-      country: string;
-    };
-    sourceOfFundsFile?: string;
-    note?: string;
+    purposeCode: string;
   }): Promise<Transfer> {
     this.setAuthToken(token);
     try {
       const requestBody = {
-        ...bankDetails,
-        amount,
-        purposeCode: 'self'
+        quotePayload: JSON.parse(bankDetails.quotePayload),
+        quoteSignature: bankDetails.quoteSignature,
+        purposeCode: bankDetails.purposeCode
       };
 
       console.log('Making withdrawToBank API request:', {
@@ -461,6 +449,52 @@ export class CopperxAPI {
         statusText: error.response?.statusText,
         data: error.response?.data,
         details: error.response?.data?.message || error.response?.data?.details
+      });
+      throw error;
+    }
+  }
+
+  async getOfframpQuote(token: string, amount: string, destinationCountry: string, preferredBankAccountId?: string): Promise<any> {
+    this.setAuthToken(token);
+    try {
+      const requestBody = {
+        amount,
+        currency: "USDC",
+        sourceCountry: "none",
+        destinationCountry,
+        onlyRemittance: true,
+        preferredBankAccountId
+      };
+
+      console.log('Getting offramp quote with params:', requestBody);
+
+      const response = await this.client.post('/api/quotes/offramp', requestBody);
+
+      console.log('Offramp quote response:', response.data);
+
+      return response.data;
+    } catch (error: any) {
+      console.error('Failed to get offramp quote:', {
+        message: error.message,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        details: error.response?.data?.message
+      });
+      throw error;
+    }
+  }
+
+  async getAccounts(token: string): Promise<any> {
+    this.setAuthToken(token);
+    try {
+      const response = await this.client.get('/api/accounts');
+      return response.data;
+    } catch (error: any) {
+      console.error('Failed to get accounts:', {
+        message: error.message,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        details: error.response?.data?.message
       });
       throw error;
     }
